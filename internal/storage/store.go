@@ -86,17 +86,20 @@ func normalizeSnapshot(value domain.Snapshot) (domain.Snapshot, error) {
 }
 
 // rebuildEnvelopes reconciles each persisted run with the fermentation
-// temperature envelope of the formula it follows.
+// temperature envelope of the formula it follows: the sticky breach fact is
+// preserved (or back-filled from older snapshots), while the current envelope
+// position is derived from the latest accepted reading.
 func rebuildEnvelopes(value domain.Snapshot) domain.Snapshot {
 	for id, run := range value.Runs {
 		formula, ok := value.Formulas[run.FormulaID]
 		if !ok {
 			continue
 		}
-		run.Envelope = domain.EnvelopeBreachFromReadings(
-			run.Observations,
-			formula.MaxFermentationTempC,
-		)
+		limit := formula.MaxFermentationTempC
+		if run.Breach == nil {
+			run.Breach = domain.HistoricalBreachFromReadings(run.Observations, limit)
+		}
+		run.Envelope = domain.CurrentEnvelopeFromReadings(run.Observations, limit)
 		value.Runs[id] = run
 	}
 	return value

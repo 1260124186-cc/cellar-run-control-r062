@@ -1,8 +1,6 @@
 package service
 
 import (
-	"time"
-
 	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/domain"
 )
 
@@ -11,12 +9,12 @@ func (s *Service) AppendObservation(
 	input ObservationInput,
 ) (domain.FermentationRun, error) {
 	var updated domain.FermentationRun
+	var rejection *domain.Error
 	err := s.store.Execute(func(snapshot *domain.Snapshot) error {
 		run, ok := snapshot.Runs[id]
 		if !ok {
 			return domain.NewError(domain.CodeRunNotFound, "run was not found")
 		}
-		now := s.clock.Now()
 		observation := domain.GravityObservation{
 			RunID:        run.ID,
 			Sequence:     input.Sequence,
@@ -24,26 +22,42 @@ func (s *Service) AppendObservation(
 			TemperatureC: input.TemperatureC,
 			ObservedAt:   input.ObservedAt.UTC(),
 			Note:         input.Note,
-			ReceivedAt:   now,
+			ReceivedAt:   s.clock.Now(),
 		}
 		envelopeLimit := envelopeLimitFor(snapshot, run)
-		if run.State == domain.RunFermenting &&
-			!domain.WithinEnvelope(observation.TemperatureC, envelopeLimit) {
-			recordEnvelopeReading(&run, observation, envelopeLimit, now)
+		excursion := run.State == domain.RunFermenting &&
+			!domain.WithinEnvelope(observation.TemperatureC, envelopeLimit)
+
+		// Validate against a probe so a rejected report never changes the
+		// observation sequence, metrics inputs, run version, or vessel state.
+		probe := run.Clone()
+		validationErr := probe.AddObservation(observation)
+		if validationErr != nil {
+			if !excursion {
+				return validationErr
+			}
+			// The excursion fact is sticky even when the report itself is
+			// rejected as impossible. Commit the marker without appending the
+			// rejected reading, then surface the validation failure.
+			run.RecordBreach(observation, envelopeLimit)
 			snapshot.Runs[id] = run.Clone()
 			updated = run.Clone()
+			rejection = domain.AsError(validationErr)
 			return nil
 		}
-		if err := run.AddObservation(observation); err != nil {
-			return err
-		}
-		run.ApplyEnvelope(observation, envelopeLimit)
+
+		run = probe
+		run.RecordBreach(observation, envelopeLimit)
+		run.SetCurrentEnvelope(observation, envelopeLimit)
 		snapshot.Runs[id] = run.Clone()
 		updated = run.Clone()
 		return nil
 	})
 	if err != nil {
 		return domain.FermentationRun{}, err
+	}
+	if rejection != nil {
+		return updated, rejection
 	}
 	return updated, nil
 }
@@ -56,20 +70,6 @@ func envelopeLimitFor(snapshot *domain.Snapshot, run domain.FermentationRun) flo
 		return 0
 	}
 	return formula.MaxFermentationTempC
-}
-
-// recordEnvelopeReading stores a reading that left the formula envelope and
-// flags the run so the excursion stays visible.
-func recordEnvelopeReading(
-	run *domain.FermentationRun,
-	observation domain.GravityObservation,
-	limitC float64,
-	now time.Time,
-) {
-	run.Observations = append(run.Observations, observation)
-	run.ApplyEnvelope(observation, limitC)
-	run.UpdatedAt = now.UTC()
-	run.Version++
 }
 
 func (s *Service) BeginConditioning(
@@ -116,7 +116,7 @@ func (s *Service) CompleteRun(
 		if !ok {
 			return domain.NewError(domain.CodeFormulaNotFound, "attached formula was not found")
 		}
-		if run.HasEnvelopeBreach() {
+		if run.CurrentlyOutsideEnvelope() {
 			return domain.NewError(domain.CodeRunState,
 				"run is still outside the formula fermentation temperature envelope")
 		}

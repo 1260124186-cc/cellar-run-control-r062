@@ -24,16 +24,21 @@ type FermentationRun struct {
 	StartedAt      *time.Time           `json:"started_at,omitempty"`
 	EndedAt        *time.Time           `json:"ended_at,omitempty"`
 	Observations   []GravityObservation `json:"observations"`
-	Envelope       *TemperatureEnvelope `json:"-"`
-	Metrics        *RunMetrics          `json:"metrics,omitempty"`
-	Version        int64                `json:"version"`
-	CreatedAt      time.Time            `json:"created_at"`
-	UpdatedAt      time.Time            `json:"updated_at"`
+	// Envelope tracks the run's current temperature-envelope position and is
+	// rebuilt from the accepted readings; it is not persisted directly.
+	Envelope *TemperatureBreach `json:"-"`
+	// Breach is the sticky fact that the run has at some point left the
+	// formula envelope. It survives recovery, invalid reports, and restarts.
+	Breach    *TemperatureBreach `json:"temperature_breach,omitempty"`
+	Metrics   *RunMetrics        `json:"metrics,omitempty"`
+	Version   int64              `json:"version"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"`
 }
 
-// TemperatureEnvelope records the accepted reading that left the attached
-// formula's fermentation temperature envelope.
-type TemperatureEnvelope struct {
+// TemperatureBreach records a reading that left the attached formula's
+// fermentation temperature envelope.
+type TemperatureBreach struct {
 	Sequence     int       `json:"sequence"`
 	ObservedAt   time.Time `json:"observed_at"`
 	TemperatureC float64   `json:"temperature_c"`
@@ -63,6 +68,10 @@ func (r FermentationRun) Clone() FermentationRun {
 		value := *r.Envelope
 		cloned.Envelope = &value
 	}
+	if r.Breach != nil {
+		value := *r.Breach
+		cloned.Breach = &value
+	}
 	return cloned
 }
 
@@ -75,45 +84,81 @@ func WithinEnvelope(temperatureC, limitC float64) bool {
 	return temperatureC <= limitC
 }
 
-// ApplyEnvelope refreshes the run's envelope marker for an accepted reading.
-func (r *FermentationRun) ApplyEnvelope(observation GravityObservation, limitC float64) {
+// RecordBreach marks the sticky fact that the run has left the formula
+// envelope. A later reading inside the envelope never clears it.
+func (r *FermentationRun) RecordBreach(observation GravityObservation, limitC float64) {
+	if WithinEnvelope(observation.TemperatureC, limitC) {
+		return
+	}
+	r.Breach = NewTemperatureBreach(observation, limitC)
+}
+
+// SetCurrentEnvelope refreshes the run's current envelope position. A reading
+// inside the envelope clears it; this derived marker is rebuilt on load.
+func (r *FermentationRun) SetCurrentEnvelope(observation GravityObservation, limitC float64) {
 	if WithinEnvelope(observation.TemperatureC, limitC) {
 		r.Envelope = nil
 		return
 	}
-	value := TemperatureEnvelope{
+	r.Envelope = NewTemperatureBreach(observation, limitC)
+}
+
+// HasTemperatureBreach reports whether the run has ever left its formula's
+// fermentation temperature envelope. The fact is sticky and survives
+// recovery.
+func (r FermentationRun) HasTemperatureBreach() bool {
+	return r.Breach != nil
+}
+
+// CurrentlyOutsideEnvelope reports whether the run's latest accepted reading
+// still sits outside the formula's fermentation temperature envelope.
+func (r FermentationRun) CurrentlyOutsideEnvelope() bool {
+	return r.Envelope != nil
+}
+
+// NewTemperatureBreach builds a breach marker for a reading.
+func NewTemperatureBreach(
+	observation GravityObservation,
+	limitC float64,
+) *TemperatureBreach {
+	return &TemperatureBreach{
 		Sequence:     observation.Sequence,
 		ObservedAt:   observation.ObservedAt.UTC(),
 		TemperatureC: observation.TemperatureC,
 		LimitC:       limitC,
 	}
-	r.Envelope = &value
 }
 
-// HasEnvelopeBreach reports whether the run still sits outside its formula's
-// fermentation temperature envelope.
-func (r FermentationRun) HasEnvelopeBreach() bool {
-	return r.Envelope != nil
-}
-
-// EnvelopeBreachFromReadings rebuilds the envelope marker for a run that was
-// loaded from a persisted snapshot.
-func EnvelopeBreachFromReadings(
+// CurrentEnvelopeFromReadings derives the run's current envelope position:
+// non-nil only when the latest accepted reading is still outside the limit.
+func CurrentEnvelopeFromReadings(
 	readings []GravityObservation,
 	limitC float64,
-) *TemperatureEnvelope {
+) *TemperatureBreach {
+	if len(readings) == 0 {
+		return nil
+	}
+	latest := readings[len(readings)-1]
+	if WithinEnvelope(latest.TemperatureC, limitC) {
+		return nil
+	}
+	return NewTemperatureBreach(latest, limitC)
+}
+
+// HistoricalBreachFromReadings derives the sticky envelope-breach fact from
+// accepted readings: the last reading that was outside the limit.
+func HistoricalBreachFromReadings(
+	readings []GravityObservation,
+	limitC float64,
+) *TemperatureBreach {
+	var breach *TemperatureBreach
 	for _, observation := range readings {
 		if WithinEnvelope(observation.TemperatureC, limitC) {
 			continue
 		}
-		return &TemperatureEnvelope{
-			Sequence:     observation.Sequence,
-			ObservedAt:   observation.ObservedAt.UTC(),
-			TemperatureC: observation.TemperatureC,
-			LimitC:       limitC,
-		}
+		breach = NewTemperatureBreach(observation, limitC)
 	}
-	return nil
+	return breach
 }
 
 func (r FermentationRun) Validate() error {

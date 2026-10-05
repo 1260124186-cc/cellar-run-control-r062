@@ -50,3 +50,12 @@ func IsCode(err error, code Code) bool {
 	var domainErr *Error
 	return errors.As(err, &domainErr) && domainErr.Code == code
 }
+
+// AsError extracts the domain error carried by err, if any.
+func AsError(err error) *Error {
+	var domainErr *Error
+	if errors.As(err, &domainErr) {
+		return domainErr
+	}
+	return nil
+}
