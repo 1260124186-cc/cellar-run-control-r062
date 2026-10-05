@@ -40,6 +40,10 @@ func Run(name string) error {
 		if err := observationsCompletion(api); err != nil {
 			return err
 		}
+	case "temperature-envelope":
+		if err := temperatureEnvelope(api); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown workflow check %q", name)
 	}

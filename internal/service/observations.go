@@ -1,8 +1,6 @@
 package service
 
 import (
-	"time"
-
 	"github.com/1260124186-cc/solo-0016-cellar-run-control/internal/domain"
 )
 
@@ -11,6 +9,7 @@ func (s *Service) AppendObservation(
 	input ObservationInput,
 ) (domain.FermentationRun, error) {
 	var updated domain.FermentationRun
+	var rejected *domain.Error
 	err := s.store.Execute(func(snapshot *domain.Snapshot) error {
 		run, ok := snapshot.Runs[id]
 		if !ok {
@@ -27,23 +26,41 @@ func (s *Service) AppendObservation(
 			ReceivedAt:   now,
 		}
 		envelopeLimit := envelopeLimitFor(snapshot, run)
-		if run.State == domain.RunFermenting &&
-			!domain.WithinEnvelope(observation.TemperatureC, envelopeLimit) {
-			recordEnvelopeReading(&run, observation, envelopeLimit, now)
-			snapshot.Runs[id] = run.Clone()
-			updated = run.Clone()
-			return nil
-		}
-		if err := run.AddObservation(observation); err != nil {
-			return err
+
+		// Every reading goes through the full domain validation. Physically
+		// valid readings beyond the formula envelope are accepted; they refresh
+		// the current marker and latch the durable excursion.
+		if addErr := run.AddObservation(observation); addErr != nil {
+			// A rejected reading leaves no trace apart from the excursion fact:
+			// even an impossible reading that exceeds the formula envelope must
+			// keep the breach history visible without touching the reading
+			// series, version, metrics, or vessel state. The latch transaction
+			// is committed deliberately; the validation error is returned to
+			// the caller afterwards. Other rejections roll back unchanged.
+			if run.State == domain.RunFermenting && run.Excursion == nil &&
+				!domain.WithinEnvelope(observation.TemperatureC, envelopeLimit) {
+				run.MarkExcursion(observation, envelopeLimit)
+				snapshot.Runs[id] = run.Clone()
+				var ok bool
+				rejected, ok = addErr.(*domain.Error)
+				if !ok {
+					return addErr
+				}
+				return nil
+			}
+			return addErr
 		}
 		run.ApplyEnvelope(observation, envelopeLimit)
+		run.MarkExcursion(observation, envelopeLimit)
 		snapshot.Runs[id] = run.Clone()
 		updated = run.Clone()
 		return nil
 	})
 	if err != nil {
 		return domain.FermentationRun{}, err
+	}
+	if rejected != nil {
+		return domain.FermentationRun{}, rejected
 	}
 	return updated, nil
 }
@@ -56,20 +73,6 @@ func envelopeLimitFor(snapshot *domain.Snapshot, run domain.FermentationRun) flo
 		return 0
 	}
 	return formula.MaxFermentationTempC
-}
-
-// recordEnvelopeReading stores a reading that left the formula envelope and
-// flags the run so the excursion stays visible.
-func recordEnvelopeReading(
-	run *domain.FermentationRun,
-	observation domain.GravityObservation,
-	limitC float64,
-	now time.Time,
-) {
-	run.Observations = append(run.Observations, observation)
-	run.ApplyEnvelope(observation, limitC)
-	run.UpdatedAt = now.UTC()
-	run.Version++
 }
 
 func (s *Service) BeginConditioning(

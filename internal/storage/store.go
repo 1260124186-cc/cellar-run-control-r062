@@ -86,17 +86,20 @@ func normalizeSnapshot(value domain.Snapshot) (domain.Snapshot, error) {
 }
 
 // rebuildEnvelopes reconciles each persisted run with the fermentation
-// temperature envelope of the formula it follows.
+// temperature envelope of the formula it follows: the current marker follows
+// the last accepted reading, while the durable excursion latch is preserved
+// when present and reconstructed from older snapshots that lack it.
 func rebuildEnvelopes(value domain.Snapshot) domain.Snapshot {
 	for id, run := range value.Runs {
 		formula, ok := value.Formulas[run.FormulaID]
 		if !ok {
 			continue
 		}
-		run.Envelope = domain.EnvelopeBreachFromReadings(
-			run.Observations,
-			formula.MaxFermentationTempC,
-		)
+		limit := formula.MaxFermentationTempC
+		run.Envelope = domain.CurrentEnvelopeFromReadings(run.Observations, limit)
+		if run.Excursion == nil {
+			run.Excursion = domain.FirstExcursionFromReadings(run.Observations, limit)
+		}
 		value.Runs[id] = run
 	}
 	return value

@@ -24,15 +24,24 @@ type FermentationRun struct {
 	StartedAt      *time.Time           `json:"started_at,omitempty"`
 	EndedAt        *time.Time           `json:"ended_at,omitempty"`
 	Observations   []GravityObservation `json:"observations"`
-	Envelope       *TemperatureEnvelope `json:"-"`
-	Metrics        *RunMetrics          `json:"metrics,omitempty"`
-	Version        int64                `json:"version"`
-	CreatedAt      time.Time            `json:"created_at"`
-	UpdatedAt      time.Time            `json:"updated_at"`
+	// Envelope describes the most recently accepted reading relative to the
+	// formula envelope. It is derived from the accepted observation series and
+	// rebuilt from the readings when a snapshot is loaded.
+	Envelope *TemperatureEnvelope `json:"temperature_envelope,omitempty"`
+	// Excursion latches the first reading that ever left the formula envelope.
+	// It is durable, survives recovery, and is never cleared by later in-range
+	// readings or by the offending reading being rejected.
+	Excursion *TemperatureEnvelope `json:"temperature_excursion,omitempty"`
+	Metrics   *RunMetrics          `json:"metrics,omitempty"`
+	Version   int64                `json:"version"`
+	CreatedAt time.Time            `json:"created_at"`
+	UpdatedAt time.Time            `json:"updated_at"`
 }
 
-// TemperatureEnvelope records the accepted reading that left the attached
-// formula's fermentation temperature envelope.
+// TemperatureEnvelope records a temperature reading relative to the attached
+// formula's fermentation temperature envelope. It describes both the current
+// position of the run (based on the last accepted reading) and the first
+// reading that ever breached the envelope (the durable excursion latch).
 type TemperatureEnvelope struct {
 	Sequence     int       `json:"sequence"`
 	ObservedAt   time.Time `json:"observed_at"`
@@ -63,6 +72,10 @@ func (r FermentationRun) Clone() FermentationRun {
 		value := *r.Envelope
 		cloned.Envelope = &value
 	}
+	if r.Excursion != nil {
+		value := *r.Excursion
+		cloned.Excursion = &value
+	}
 	return cloned
 }
 
@@ -75,30 +88,75 @@ func WithinEnvelope(temperatureC, limitC float64) bool {
 	return temperatureC <= limitC
 }
 
-// ApplyEnvelope refreshes the run's envelope marker for an accepted reading.
+// ApplyEnvelope refreshes the run's current envelope marker from the most
+// recently accepted reading. A reading back inside the envelope clears the
+// marker because the run is no longer sitting outside its temperature limits.
 func (r *FermentationRun) ApplyEnvelope(observation GravityObservation, limitC float64) {
 	if WithinEnvelope(observation.TemperatureC, limitC) {
 		r.Envelope = nil
 		return
 	}
-	value := TemperatureEnvelope{
+	r.Envelope = envelopeMarker(observation, limitC)
+}
+
+// MarkExcursion latches the durable record of a reading that left the formula
+// envelope. The first excursion is retained permanently; later readings never
+// overwrite or clear it, so the breach history stays visible even when the run
+// returns to range or the reading is otherwise rejected.
+func (r *FermentationRun) MarkExcursion(observation GravityObservation, limitC float64) {
+	if WithinEnvelope(observation.TemperatureC, limitC) {
+		return
+	}
+	if r.Excursion != nil {
+		return
+	}
+	r.Excursion = envelopeMarker(observation, limitC)
+}
+
+func envelopeMarker(observation GravityObservation, limitC float64) *TemperatureEnvelope {
+	return &TemperatureEnvelope{
 		Sequence:     observation.Sequence,
 		ObservedAt:   observation.ObservedAt.UTC(),
 		TemperatureC: observation.TemperatureC,
 		LimitC:       limitC,
 	}
-	r.Envelope = &value
 }
 
-// HasEnvelopeBreach reports whether the run still sits outside its formula's
-// fermentation temperature envelope.
+// HasEnvelopeBreach reports whether the run currently sits outside its
+// formula's fermentation temperature envelope according to its last accepted
+// reading.
 func (r FermentationRun) HasEnvelopeBreach() bool {
 	return r.Envelope != nil
 }
 
-// EnvelopeBreachFromReadings rebuilds the envelope marker for a run that was
-// loaded from a persisted snapshot.
-func EnvelopeBreachFromReadings(
+// HadTemperatureExcursion reports whether any reading on the run ever left the
+// formula envelope, even if the run has since returned inside it.
+func (r FermentationRun) HadTemperatureExcursion() bool {
+	return r.Excursion != nil
+}
+
+// CurrentEnvelopeFromReadings rebuilds the current envelope marker for a run
+// loaded from a persisted snapshot. The marker follows the most recently
+// accepted reading: it is present only when that reading is still outside the
+// envelope, so runs that returned to range complete normally.
+func CurrentEnvelopeFromReadings(
+	readings []GravityObservation,
+	limitC float64,
+) *TemperatureEnvelope {
+	if len(readings) == 0 {
+		return nil
+	}
+	last := readings[len(readings)-1]
+	if WithinEnvelope(last.TemperatureC, limitC) {
+		return nil
+	}
+	return envelopeMarker(last, limitC)
+}
+
+// FirstExcursionFromReadings rebuilds the durable excursion latch for a run
+// loaded from an older snapshot that does not carry the latch itself. The first
+// reading that left the envelope wins.
+func FirstExcursionFromReadings(
 	readings []GravityObservation,
 	limitC float64,
 ) *TemperatureEnvelope {
@@ -106,12 +164,7 @@ func EnvelopeBreachFromReadings(
 		if WithinEnvelope(observation.TemperatureC, limitC) {
 			continue
 		}
-		return &TemperatureEnvelope{
-			Sequence:     observation.Sequence,
-			ObservedAt:   observation.ObservedAt.UTC(),
-			TemperatureC: observation.TemperatureC,
-			LimitC:       limitC,
-		}
+		return envelopeMarker(observation, limitC)
 	}
 	return nil
 }

@@ -76,6 +76,17 @@ and `aborted`.
 - `reserved -> fermenting` requires that the vessel still belongs to the run.
 - `fermenting -> conditioning` requires at least two observations.
 - `conditioning -> completed` requires at least three observations.
+- Completion is allowed only when the most recently accepted reading is inside
+  the formula envelope. A run that returned inside the envelope completes
+  normally even after a controller restart.
+- A reading that ever exceeded the formula's maximum fermentation temperature
+  latches a durable excursion record. It stays visible in run details after the
+  run returns to range, after the reading itself is rejected, and after
+  completion; it cannot be cleared by deleting or correcting readings.
+- A reading rejected by validation (for example a temperature outside the
+  -5 to 60 Celsius range) is not stored as an observation and does not change
+  the run version, metrics, or vessel state, but still latches the excursion
+  when its temperature exceeds the formula envelope.
 - Completion computes apparent attenuation and estimated alcohol by volume from
   the formula target original gravity and the last observation.
 - Completion moves the vessel to cleaning without losing its run association.
@@ -217,6 +228,7 @@ behavior, and exit without external services:
 - `go run ./cmd/fermentctl check formula-approval`
 - `go run ./cmd/fermentctl check vessel-run-lifecycle`
 - `go run ./cmd/fermentctl check observations-completion`
+- `go run ./cmd/fermentctl check temperature-envelope`
 
 ## Scope Limits
 
